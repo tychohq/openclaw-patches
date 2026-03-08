@@ -133,8 +133,21 @@ check_pins_for_merge() {
   return 1
 }
 
+# Check if a config path matches any pinned path.
+# Returns 0 if a pin is hit, prints the matching pin.
+path_hits_pin() {
+  local cfg_path="$1"
+  for pin in "${PINNED_PATHS[@]}"; do
+    if [[ "$cfg_path" == "$pin" || "$cfg_path" == "$pin".* || "$pin" == "$cfg_path".* ]]; then
+      echo "$pin"
+      return 0
+    fi
+  done
+  return 1
+}
+
 # Check if any step in a patch touches a pinned config path.
-# Scans all config_patch steps' merge files.
+# Scans config_set steps (path field) and config_patch steps (merge files).
 # Returns 0 if a pin is hit, prints the matching pin.
 patch_hits_pin() {
   local patch_file="$1"
@@ -149,7 +162,15 @@ patch_hits_pin() {
     [[ -f "$step_file" ]] || continue
     local stype
     stype="$(yaml_get "$step_file" "type")"
-    if [[ "$stype" == "config_patch" ]]; then
+
+    if [[ "$stype" == "config_set" ]]; then
+      # config_set has a direct 'path' field (e.g. agents.defaults.model)
+      local cfg_path
+      cfg_path="$(yaml_get "$step_file" "path")"
+      if [[ -n "$cfg_path" ]]; then
+        hit="$(path_hits_pin "$cfg_path")" && break
+      fi
+    elif [[ "$stype" == "config_patch" ]]; then
       local mf
       mf="$(yaml_get "$step_file" "merge_file")"
       if [[ -n "$mf" && -f "$FILES_DIR/$mf" ]]; then
@@ -255,6 +276,7 @@ exec_step() {
   
   case "$step_type" in
     file)           exec_step_file "$step_file" ;;
+    config_set)     exec_step_config_set "$step_file" ;;
     config_patch)   exec_step_config_patch "$step_file" ;;
     skill)          exec_step_skill "$step_file" ;;
     clawhub)        exec_step_clawhub "$step_file" ;;
@@ -293,6 +315,38 @@ exec_step_file() {
     # Check for multi-line content block
     die "file step needs 'content_file' or 'content'"
   fi
+}
+
+exec_step_config_set() {
+  local step_file="$1"
+  need_cmd jq
+
+  local config_file="$OPENCLAW_HOME/openclaw.json"
+  [[ -f "$config_file" ]] || die "openclaw.json not found at $config_file"
+
+  local cfg_path cfg_value
+  cfg_path="$(yaml_get "$step_file" "path")"
+  cfg_value="$(yaml_get "$step_file" "value")"
+
+  [[ -z "$cfg_path" ]] && die "config_set step missing 'path'"
+  [[ -z "$cfg_value" ]] && die "config_set step missing 'value'"
+
+  # Build jq path from dot-notation (e.g. agents.defaults.model → .agents.defaults.model)
+  local jq_path=".$(echo "$cfg_path" | sed 's/\././g')"
+
+  # Try to parse value as JSON; if it fails, treat as string
+  local tmp
+  tmp=$(mktemp)
+  if echo "$cfg_value" | jq . >/dev/null 2>&1; then
+    # Value is valid JSON — set it directly
+    jq --argjson val "$cfg_value" "${jq_path} = \$val" "$config_file" > "$tmp"
+  else
+    # Value is a plain string
+    jq --arg val "$cfg_value" "${jq_path} = \$val" "$config_file" > "$tmp"
+  fi
+
+  mv "$tmp" "$config_file"
+  info "Config set: $cfg_path"
 }
 
 exec_step_config_patch() {
