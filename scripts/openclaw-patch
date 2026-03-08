@@ -37,6 +37,49 @@ SKILLS_DIR="$REPO_ROOT/skills"
 OPENCLAW_HOME="${OPENCLAW_HOME:-$HOME/.openclaw}"
 STATE_DIR="$OPENCLAW_HOME/patches"
 APPLIED_FILE="$STATE_DIR/applied.json"
+PATCH_CONFIG="$OPENCLAW_HOME/openclaw-patch.yaml"
+
+# ── Auto-source .env ──────────────────────────────────────────────────────────
+
+if [[ -f "$OPENCLAW_HOME/.env" ]]; then
+  set -a
+  # shellcheck disable=SC1091
+  source "$OPENCLAW_HOME/.env"
+  set +a
+fi
+
+# ── Load openclaw-patch.yaml (pin & skip lists) ──────────────────────────────
+
+PINNED_PATHS=()
+SKIPPED_PATCHES=()
+
+if [[ -f "$PATCH_CONFIG" ]]; then
+  _in_section=""
+  while IFS= read -r _line; do
+    # Detect section headers
+    if [[ "$_line" =~ ^pin: ]]; then
+      _in_section="pin"; continue
+    elif [[ "$_line" =~ ^skip: ]]; then
+      _in_section="skip"; continue
+    elif [[ "$_line" =~ ^[a-z] ]]; then
+      _in_section=""; continue
+    fi
+
+    # Parse list items
+    if [[ "$_in_section" == "pin" && "$_line" =~ ^[[:space:]]*-[[:space:]]+(.*) ]]; then
+      local_val="${BASH_REMATCH[1]}"
+      local_val="${local_val%\"}" ; local_val="${local_val#\"}"
+      local_val="${local_val%\'}" ; local_val="${local_val#\'}"
+      PINNED_PATHS+=("$local_val")
+    elif [[ "$_in_section" == "skip" && "$_line" =~ ^[[:space:]]*-[[:space:]]+(.*) ]]; then
+      local_val="${BASH_REMATCH[1]}"
+      local_val="${local_val%\"}" ; local_val="${local_val#\"}"
+      local_val="${local_val%\'}" ; local_val="${local_val#\'}"
+      SKIPPED_PATCHES+=("$local_val")
+    fi
+  done < "$PATCH_CONFIG"
+  unset _in_section _line local_val
+fi
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
