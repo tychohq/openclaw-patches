@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Prevent unbound variable errors for env vars that may not exist on all platforms
+: "${DISPLAY:=}"
+
 # ── openclaw-patch — Declarative patch system for OpenClaw deployments ────────
 #
 # Usage:
@@ -37,7 +40,7 @@ SKILLS_DIR="$REPO_ROOT/skills"
 OPENCLAW_HOME="${OPENCLAW_HOME:-$HOME/.openclaw}"
 STATE_DIR="$OPENCLAW_HOME/patches"
 APPLIED_FILE="$STATE_DIR/applied.json"
-PATCH_CONFIG="$OPENCLAW_HOME/openclaw-patch.yaml"
+PATCH_CONFIG="$OPENCLAW_HOME/patch-lock.yaml"
 
 # ── Auto-source .env ──────────────────────────────────────────────────────────
 
@@ -90,6 +93,77 @@ ok()   { echo "✓ $*"; }
 
 need_cmd() {
   command -v "$1" &>/dev/null || die "Required command not found: $1"
+}
+
+# Check if a patch is in the skip list
+is_skipped_patch() {
+  local patch_id="$1"
+  for s in "${SKIPPED_PATCHES[@]}"; do
+    [[ "$s" == "$patch_id" ]] && return 0
+  done
+  return 1
+}
+
+# Get all leaf dot-paths from a JSON file (e.g. "agents.defaults.model")
+json_leaf_paths() {
+  local json_file="$1"
+  jq -r '[path(..)|select(length>0)] | map(map(tostring)|join(".")) | .[]' "$json_file" 2>/dev/null | sort -u
+}
+
+# Check if a JSON merge file touches any pinned config path.
+# Returns 0 (true) if a pin is hit, and prints the first matching pin.
+# A pin matches if it equals or is a prefix/suffix of any JSON path.
+check_pins_for_merge() {
+  local merge_file="$1"
+  [[ ${#PINNED_PATHS[@]} -eq 0 ]] && return 1
+
+  local paths
+  paths="$(json_leaf_paths "$merge_file")"
+  [[ -z "$paths" ]] && return 1
+
+  for pin in "${PINNED_PATHS[@]}"; do
+    while IFS= read -r jp; do
+      # Exact match, or pin is a prefix of the path, or path is a prefix of the pin
+      if [[ "$jp" == "$pin" || "$jp" == "$pin".* || "$pin" == "$jp".* ]]; then
+        echo "$pin"
+        return 0
+      fi
+    done <<< "$paths"
+  done
+  return 1
+}
+
+# Check if any step in a patch touches a pinned config path.
+# Scans all config_patch steps' merge files.
+# Returns 0 if a pin is hit, prints the matching pin.
+patch_hits_pin() {
+  local patch_file="$1"
+  [[ ${#PINNED_PATHS[@]} -eq 0 ]] && return 1
+
+  local tmp_dir
+  tmp_dir="$(mktemp -d)"
+  parse_steps "$patch_file" "$tmp_dir" > /dev/null
+
+  local hit=""
+  for step_file in "$tmp_dir"/step-*.yaml; do
+    [[ -f "$step_file" ]] || continue
+    local stype
+    stype="$(yaml_get "$step_file" "type")"
+    if [[ "$stype" == "config_patch" ]]; then
+      local mf
+      mf="$(yaml_get "$step_file" "merge_file")"
+      if [[ -n "$mf" && -f "$FILES_DIR/$mf" ]]; then
+        hit="$(check_pins_for_merge "$FILES_DIR/$mf")" && break
+      fi
+    fi
+  done
+
+  rm -rf "$tmp_dir"
+  if [[ -n "$hit" ]]; then
+    echo "$hit"
+    return 0
+  fi
+  return 1
 }
 
 # Minimal YAML parser — extracts top-level scalar fields from a patch manifest.
@@ -631,6 +705,24 @@ cmd_apply() {
       continue
     fi
     
+    # Skip if patch is in the skip list
+    if [[ ${#SKIPPED_PATCHES[@]} -gt 0 ]] && is_skipped_patch "$id"; then
+      info "⏭️  Skipping patch '$id': listed in patch-lock.yaml skip"
+      skipped=$((skipped + 1))
+      continue
+    fi
+    
+    # Skip if any step touches a pinned config path (atomic — whole patch skipped)
+    local pinned_hit=""
+    if [[ ${#PINNED_PATHS[@]} -gt 0 ]]; then
+      pinned_hit="$(patch_hits_pin "$patch_file")" || true
+    fi
+    if [[ -n "$pinned_hit" ]]; then
+      info "⏭️  Skipping patch '$id': touches pinned path '$pinned_hit'"
+      skipped=$((skipped + 1))
+      continue
+    fi
+    
     if $dry_run; then
       info "[DRY RUN] Would apply: $id — $desc"
       applied=$((applied + 1))
@@ -713,6 +805,10 @@ cmd_status() {
     if is_applied "$id"; then
       printf "  ✓ %-30s %s\n" "$id" "$desc"
       applied=$((applied + 1))
+    elif [[ ${#SKIPPED_PATCHES[@]} -gt 0 ]] && is_skipped_patch "$id"; then
+      printf "  ⏭ %-30s %s (skipped)\n" "$id" "$desc"
+    elif [[ ${#PINNED_PATHS[@]} -gt 0 ]] && pinned_hit="$(patch_hits_pin "$patch_file")" 2>/dev/null; then
+      printf "  📌 %-30s %s (pinned: %s)\n" "$id" "$desc" "$pinned_hit"
     else
       printf "  ○ %-30s %s\n" "$id" "$desc"
       pending=$((pending + 1))
