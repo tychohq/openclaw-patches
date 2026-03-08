@@ -785,6 +785,14 @@ cmd_apply() {
     
     info "Applying: $id — $desc"
     
+    # Snapshot pinned config values before applying (safety net for exec/file steps)
+    local config_file="$OPENCLAW_HOME/openclaw.json"
+    local config_backup=""
+    if [[ ${#PINNED_PATHS[@]} -gt 0 && -f "$config_file" ]]; then
+      config_backup="$(mktemp)"
+      cp "$config_file" "$config_backup"
+    fi
+    
     # Parse and execute steps
     local tmp_dir
     tmp_dir="$(mktemp -d)"
@@ -804,9 +812,39 @@ cmd_apply() {
     rm -rf "$tmp_dir"
     
     if $step_failed; then
+      # Restore config if we have a backup
+      if [[ -n "$config_backup" && -f "$config_backup" ]]; then
+        cp "$config_backup" "$config_file"
+        rm -f "$config_backup"
+      fi
       warn "Patch $id failed — stopping"
       failed=$((failed + 1))
       break
+    fi
+    
+    # Post-apply verification: check if any pinned values were modified
+    if [[ -n "$config_backup" && -f "$config_backup" && -f "$config_file" ]]; then
+      local pin_violated=""
+      for pin in "${PINNED_PATHS[@]}"; do
+        local jq_path=".$(echo "$pin" | sed 's/\././g')"
+        local before after
+        before="$(jq -c "$jq_path // empty" "$config_backup" 2>/dev/null)" || true
+        after="$(jq -c "$jq_path // empty" "$config_file" 2>/dev/null)" || true
+        if [[ "$before" != "$after" ]]; then
+          pin_violated="$pin"
+          break
+        fi
+      done
+      
+      if [[ -n "$pin_violated" ]]; then
+        warn "Patch '$id' modified pinned path '$pin_violated' — reverting config"
+        cp "$config_backup" "$config_file"
+        rm -f "$config_backup"
+        failed=$((failed + 1))
+        # Don't mark as applied — it was reverted
+        continue
+      fi
+      rm -f "$config_backup"
     fi
     
     mark_applied "$id"
